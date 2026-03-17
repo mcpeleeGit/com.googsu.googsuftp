@@ -145,6 +145,60 @@ struct ConnectionView: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
             }
+
+            if !ftpManager.attemptPlan.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("재시도 시도 목록")
+                        .font(.caption)
+                        .fontWeight(.medium)
+                        .foregroundColor(.secondary)
+
+                    if let idx = ftpManager.currentAttemptIndex, idx < ftpManager.attemptPlan.count {
+                        Text("현재 재시도: \(idx + 1)/\(ftpManager.attemptPlan.count) - \(ftpManager.attemptPlan[idx])")
+                            .font(.caption2)
+                            .foregroundColor(.orange)
+                    }
+                    
+                    ForEach(Array(ftpManager.attemptPlan.enumerated()), id: \.offset) { idx, label in
+                        HStack(spacing: 6) {
+                            Text(idx == ftpManager.currentAttemptIndex ? "▶︎" : "•")
+                                .font(.caption2)
+                                .foregroundColor(idx == ftpManager.currentAttemptIndex ? .orange : .secondary)
+                            Text(label)
+                                .font(.caption2)
+                                .foregroundColor(idx == ftpManager.currentAttemptIndex ? .orange : .secondary)
+                        }
+                    }
+                    
+                    if let err = ftpManager.lastAttemptError, !err.isEmpty {
+                        Text("마지막 실패: \(err)")
+                            .font(.caption2)
+                            .foregroundColor(.red)
+                            .multilineTextAlignment(.leading)
+                    }
+                    
+                    Button(action: { ftpManager.retryLastListing() }) {
+                        HStack {
+                            if ftpManager.isAttemptRunning {
+                                ProgressView()
+                                    .scaleEffect(0.7)
+                                    .tint(.white)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            Text(ftpManager.isAttemptRunning ? "재시도 중..." : "목록 조회 재시도")
+                        }
+                        .font(.caption)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(ftpManager.connectionState == .connected ? Color.orange : Color.gray)
+                        .foregroundColor(.white)
+                        .cornerRadius(6)
+                    }
+                    .disabled(ftpManager.connectionState != .connected || ftpManager.isAttemptRunning)
+                }
+                .padding(.horizontal)
+            }
             
             if ftpManager.connectionState == .connecting {
                 VStack(spacing: 8) {
