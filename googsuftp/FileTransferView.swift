@@ -276,6 +276,8 @@ extension FileTransferView {
     }
 }
 
-#Preview {
-    FileTransferView(ftpManager: FTPManager())
+struct FileTransferView_Previews: PreviewProvider {
+    static var previews: some View {
+        FileTransferView(ftpManager: FTPManager())
+    }
 }

@@ -3,23 +3,22 @@ import SwiftUI
 struct FileBrowserView: View {
     @ObservedObject var ftpManager: FTPManager
     @State private var selectedItems: Set<String> = []
+    @State private var selectedItemName: String?
     @State private var showingNewFolderSheet = false
     @State private var newFolderName = ""
     @State private var showingDeleteAlert = false
     @State private var itemToDelete: FTPItem?
+    @State private var editorContent = ""
+    @State private var editorOriginalContent = ""
+    @State private var editorStatus = "파일을 선택하면 미리보기와 편집기가 열립니다."
+    @State private var isEditorLoading = false
+    @State private var isSavingEditor = false
     
     var body: some View {
         VStack(spacing: 0) {
-            // 상단 툴바
             toolbarView
-            
-            // 경로 표시
             pathView
-            
-            // 파일 목록
-            fileListView
-            
-            // 하단 상태바
+            browserSplitView
             statusView
         }
         .sheet(isPresented: $showingNewFolderSheet) {
@@ -35,6 +34,18 @@ struct FileBrowserView: View {
         } message: {
             if let item = itemToDelete {
                 Text("\(item.name)을(를) 삭제하시겠습니까?")
+            }
+        }
+        .onChange(of: ftpManager.currentDirectory) {
+            selectedItems.removeAll()
+            selectedItemName = nil
+            clearEditor(message: "다른 폴더로 이동했습니다. 파일을 다시 선택해 주세요.")
+        }
+        .onChange(of: ftpManager.items.map(\.name)) {
+            guard let selectedItemName else { return }
+            if !ftpManager.items.contains(where: { $0.name == selectedItemName }) {
+                self.selectedItemName = nil
+                clearEditor(message: "현재 폴더에서 선택한 파일을 찾을 수 없습니다.")
             }
         }
     }
@@ -84,18 +95,86 @@ struct FileBrowserView: View {
         .background(Color(NSColor.controlBackgroundColor))
     }
     
+    private var browserSplitView: some View {
+        HSplitView {
+            fileListView
+                .frame(minWidth: 280, idealWidth: 340)
+            editorPane
+                .frame(minWidth: 360)
+        }
+    }
+    
     private var fileListView: some View {
         List {
             ForEach(ftpManager.items, id: \.name) { item in
                 FileItemRow(
                     item: item,
                     isSelected: selectedItems.contains(item.name),
-                    onSelect: { toggleSelection(item.name) },
+                    isFocused: selectedItemName == item.name,
+                    onSelect: { handleSingleClick(item) },
                     onDoubleClick: { handleItemDoubleClick(item) }
                 )
             }
         }
-        .listStyle(PlainListStyle())
+        .listStyle(.plain)
+    }
+    
+    private var editorPane: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(editorTitle)
+                        .font(.headline)
+                    Text(editorStatus)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(2)
+                }
+                
+                Spacer()
+                
+                if selectedFileItem != nil {
+                    Button(isSavingEditor ? "저장 중..." : "저장 후 업로드") {
+                        saveEditor()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canSaveEditor)
+                }
+            }
+            .padding()
+            .background(Color(NSColor.controlBackgroundColor))
+            
+            Group {
+                if let selectedFileItem {
+                    if selectedFileItem.isDirectory {
+                        placeholderView(
+                            title: "폴더가 선택되었습니다",
+                            message: "폴더는 오른쪽에서 편집하지 않습니다. 더블 클릭하면 하위 목록으로 이동합니다."
+                        )
+                    } else if isEditorLoading {
+                        VStack(spacing: 12) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("파일 내용을 불러오는 중입니다.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        TextEditor(text: $editorContent)
+                            .font(.system(.body, design: .monospaced))
+                            .padding(8)
+                    }
+                } else {
+                    placeholderView(
+                        title: "파일을 선택해 주세요",
+                        message: "왼쪽 목록에서 텍스트 파일을 한 번 클릭하면 내용을 불러오고, 수정 후 바로 저장 업로드할 수 있습니다."
+                    )
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(Color(NSColor.textBackgroundColor))
     }
     
     private var statusView: some View {
@@ -154,21 +233,100 @@ struct FileBrowserView: View {
         }
     }
     
-    private func toggleSelection(_ itemName: String) {
-        if selectedItems.contains(itemName) {
-            selectedItems.remove(itemName)
+    private var selectedFileItem: FTPItem? {
+        guard let selectedItemName else { return nil }
+        return ftpManager.items.first(where: { $0.name == selectedItemName })
+    }
+    
+    private var editorTitle: String {
+        selectedFileItem?.name ?? "편집기"
+    }
+    
+    private var canSaveEditor: Bool {
+        guard let selectedFileItem, !selectedFileItem.isDirectory else { return false }
+        return !isEditorLoading && !isSavingEditor && editorContent != editorOriginalContent
+    }
+    
+    private func placeholderView(title: String, message: String) -> some View {
+        VStack(spacing: 10) {
+            Text(title)
+                .font(.headline)
+            Text(message)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 320)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+    
+    private func handleSingleClick(_ item: FTPItem) {
+        toggleSelection(item.name)
+        selectedItemName = item.name
+        
+        if item.isDirectory {
+            clearEditor(message: "폴더를 선택했습니다. 더블 클릭하면 하위 폴더로 이동합니다.")
         } else {
-            selectedItems.insert(itemName)
+            loadEditor(for: item)
         }
     }
     
     private func handleItemDoubleClick(_ item: FTPItem) {
         if item.isDirectory {
+            selectedItemName = item.name
+            clearEditor(message: "폴더를 여는 중입니다.")
             ftpManager.changeDirectory(item.name)
         } else {
-            // 파일 다운로드 또는 미리보기
-            print("파일 선택: \(item.name)")
+            selectedItemName = item.name
+            loadEditor(for: item)
         }
+    }
+    
+    private func loadEditor(for item: FTPItem) {
+        isEditorLoading = true
+        editorStatus = "\(item.name) 내용을 불러오는 중입니다."
+        ftpManager.loadTextFile(named: item.name) { result in
+            isEditorLoading = false
+            switch result {
+            case .success(let text):
+                editorContent = text
+                editorOriginalContent = text
+                editorStatus = "수정 후 저장하면 같은 이름으로 바로 업로드됩니다."
+            case .failure(let error):
+                editorContent = ""
+                editorOriginalContent = ""
+                editorStatus = error.localizedDescription
+            }
+        }
+    }
+    
+    private func saveEditor() {
+        guard let selectedFileItem, !selectedFileItem.isDirectory else { return }
+        isSavingEditor = true
+        editorStatus = "\(selectedFileItem.name) 저장 후 업로드 중입니다."
+        
+        ftpManager.saveTextFile(named: selectedFileItem.name, content: editorContent) { result in
+            isSavingEditor = false
+            switch result {
+            case .success:
+                editorOriginalContent = editorContent
+                editorStatus = "저장과 업로드가 완료되었습니다."
+            case .failure(let error):
+                editorStatus = error.localizedDescription
+            }
+        }
+    }
+    
+    private func clearEditor(message: String) {
+        editorContent = ""
+        editorOriginalContent = ""
+        editorStatus = message
+        isEditorLoading = false
+        isSavingEditor = false
+    }
+    
+    private func toggleSelection(_ itemName: String) {
+        selectedItems = [itemName]
     }
     
     private func deleteSelectedItems() {
@@ -186,18 +344,16 @@ struct FileBrowserView: View {
 struct FileItemRow: View {
     let item: FTPItem
     let isSelected: Bool
+    let isFocused: Bool
     let onSelect: () -> Void
     let onDoubleClick: () -> Void
     
     var body: some View {
         HStack {
-            Button(action: onSelect) {
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .foregroundColor(isSelected ? .blue : .gray)
-            }
-            .buttonStyle(PlainButtonStyle())
+            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                .foregroundColor(isSelected ? .blue : .gray)
             
-            Image(systemName: item.isDirectory ? "folder" : "doc")
+            Image(systemName: item.isDirectory ? "folder" : "doc.text")
                 .foregroundColor(item.isDirectory ? .blue : .gray)
             
             VStack(alignment: .leading, spacing: 2) {
@@ -205,33 +361,37 @@ struct FileItemRow: View {
                     .fontWeight(.medium)
                 
                 HStack {
-                    if item.isDirectory {
-                        Text("폴더")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    } else {
-                        Text(formatFileSize(item.size))
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+                    Text(item.isDirectory ? "폴더" : formatFileSize(item.size))
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                     
                     if let permissions = item.permissions {
                         Text(permissions)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
                             .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.secondary)
                     }
                 }
             }
             
             Spacer()
         }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 6)
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) {
-            onDoubleClick()
+        .background(rowBackground)
+        .cornerRadius(6)
+        .onTapGesture { onSelect() }
+        .onTapGesture(count: 2) { onDoubleClick() }
+    }
+    
+    private var rowBackground: Color {
+        if isFocused {
+            return Color.blue.opacity(0.16)
         }
-        .background(isSelected ? Color.blue.opacity(0.1) : Color.clear)
-        .cornerRadius(4)
+        if isSelected {
+            return Color.blue.opacity(0.08)
+        }
+        return .clear
     }
     
     private func formatFileSize(_ size: Int64) -> String {
@@ -242,6 +402,8 @@ struct FileItemRow: View {
     }
 }
 
-#Preview {
-    FileBrowserView(ftpManager: FTPManager())
+struct FileBrowserView_Previews: PreviewProvider {
+    static var previews: some View {
+        FileBrowserView(ftpManager: FTPManager())
+    }
 }
