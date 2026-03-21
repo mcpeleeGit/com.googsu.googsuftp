@@ -142,7 +142,8 @@ struct FTPServer {
 }
 
 // FTP 파일/디렉토리 정보
-struct FTPItem {
+struct FTPItem: Identifiable, Hashable, Codable {
+    var id: String { name }
     let name: String
     let isDirectory: Bool
     let size: Int64
@@ -193,6 +194,18 @@ enum FTPOperationType {
     case delete
     case createDirectory
     case rename
+}
+
+struct FTPDirectorySnapshot {
+    let path: String
+    let items: [FTPItem]
+    let fetchedAt: Date
+    let source: Source
+    
+    enum Source {
+        case cache
+        case remote
+    }
 }
 
 enum FTPDiagnosticLevel {
@@ -281,5 +294,74 @@ struct FTPRecentConnection: Identifiable, Codable, Equatable {
             return "\(host):\(port)"
         }
         return "\(host):\(port) (\(username))"
+    }
+}
+
+struct FTPSavedConnection: Identifiable, Codable, Equatable {
+    let id: UUID
+    let name: String
+    let host: String
+    let port: Int
+    let username: String
+    let password: String
+    let encryptionMode: FTPEncryptionMode
+    let logonType: FTPLogonType
+    let options: FTPConnectionOptions
+    let updatedAt: Date
+
+    init(
+        id: UUID = UUID(),
+        name: String,
+        host: String,
+        port: Int,
+        username: String,
+        password: String,
+        encryptionMode: FTPEncryptionMode,
+        logonType: FTPLogonType,
+        options: FTPConnectionOptions,
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.name = name
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.encryptionMode = encryptionMode
+        self.logonType = logonType
+        self.options = options
+        self.updatedAt = updatedAt
+    }
+
+    init(id: UUID = UUID(), server: FTPServer, updatedAt: Date = Date()) {
+        self.init(
+            id: id,
+            name: server.connectionName.isEmpty ? FTPRecentConnection.makeDefaultName(host: server.host, port: server.port, username: server.username, logonType: server.logonType) : server.connectionName,
+            host: server.host,
+            port: server.port,
+            username: server.username,
+            password: server.password,
+            encryptionMode: server.encryptionMode,
+            logonType: server.logonType,
+            options: server.options,
+            updatedAt: updatedAt
+        )
+    }
+
+    var displayName: String {
+        name
+    }
+
+    func asServer() -> FTPServer {
+        FTPServer(
+            host: host,
+            port: port,
+            username: username,
+            password: password,
+            encryptionMode: encryptionMode,
+            logonType: logonType,
+            connectionName: name,
+            options: options
+        )
     }
 }

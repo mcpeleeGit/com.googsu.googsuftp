@@ -7,4 +7,5 @@
 # Build products
 DerivedData/
 build/
+.deriveddata/
 

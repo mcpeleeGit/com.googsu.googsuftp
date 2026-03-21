@@ -4,7 +4,16 @@ import Darwin
 
 final class FTPManager: ObservableObject {
     private static let recentConnectionsKey = "FTPRecentConnections"
+    private static let savedConnectionsKey = "FTPSavedConnections"
     private static let recentConnectionsLimit = 8
+    private static let directoryCacheTTL: TimeInterval = 20
+    private static let textFileCacheTTL: TimeInterval = 30
+    private static let persistedDirectoryCacheTTL: TimeInterval = 60 * 60 * 24 * 7
+    private static let persistedDirectoryCacheLimit = 300
+    private static let persistedDirectoryCachePrefix = "FTPDirectoryCache."
+    private static let backgroundPrefetchLimit = 200
+    private static let pollSleepIdle: TimeInterval = 0.01
+    private static let pollSleepActive: TimeInterval = 0.005
     
     @Published var connectionState: FTPConnectionState = .disconnected
     @Published var statusDetail: String = ""
@@ -14,11 +23,16 @@ final class FTPManager: ObservableObject {
     @Published var isAttemptRunning: Bool = false
     @Published var currentDirectory: String = "/"
     @Published var items: [FTPItem] = []
+    @Published var isUsingCachedListing = false
+    @Published var lastListingAt: Date?
+    @Published var lastListingDuration: TimeInterval?
+    @Published var pendingNavigationPath: String?
     @Published var operations: [FTPOperation] = []
     @Published var diagnostics: [FTPDiagnostic] = []
     @Published var eventLog: [String] = []
     @Published var lastUsedServer: FTPServer?
     @Published var recentConnections: [FTPRecentConnection] = []
+    @Published var savedConnections: [FTPSavedConnection] = []
     
     private let networkQueue = DispatchQueue(label: "FTPManager.networkQueue")
     
@@ -32,9 +46,43 @@ final class FTPManager: ObservableObject {
     private var successfulListAttempt: (label: String, mode: String, command: String)?
     private var featureFlags: Set<String>?
     private var usesPrivateDataProtection = false
+    private var currentTransferType: String?
+    private var activeListingPath: String?
+    private var directoryCache: [String: CachedDirectoryListing] = [:]
+    private var textFileCache: [String: CachedTextFile] = [:]
+    private var backgroundPrefetchQueue: [String] = []
+    private var backgroundPrefetchSeen: Set<String> = []
+    private var backgroundPrefetchBudget = 0
+    private var isBackgroundPrefetchScheduled = false
+    private var isBackgroundPrefetchRunning = false
+
+    private struct CachedDirectoryListing {
+        let items: [FTPItem]
+        let fetchedAt: Date
+
+        var isFresh: Bool {
+            Date().timeIntervalSince(fetchedAt) < FTPManager.directoryCacheTTL
+        }
+    }
+
+    private struct CachedTextFile {
+        let content: String
+        let fetchedAt: Date
+
+        var isFresh: Bool {
+            Date().timeIntervalSince(fetchedAt) < FTPManager.textFileCacheTTL
+        }
+    }
+
+    private struct PersistedDirectoryCacheEntry: Codable {
+        let path: String
+        let items: [FTPItem]
+        let fetchedAt: Date
+    }
     
     init() {
         loadRecentConnections()
+        loadSavedConnections()
     }
     
     private func resetForNewConnection(server: FTPServer) {
@@ -43,6 +91,10 @@ final class FTPManager: ObservableObject {
             self.connectionState = .connecting
             self.currentDirectory = "/"
             self.items = []
+            self.isUsingCachedListing = false
+            self.lastListingAt = nil
+            self.lastListingDuration = nil
+            self.pendingNavigationPath = nil
             self.attemptPlan = []
             self.currentAttemptIndex = nil
             self.lastAttemptError = nil
@@ -53,6 +105,15 @@ final class FTPManager: ObservableObject {
         successfulListAttempt = nil
         featureFlags = nil
         usesPrivateDataProtection = false
+        currentTransferType = nil
+        activeListingPath = nil
+        directoryCache.removeAll()
+        textFileCache.removeAll()
+        backgroundPrefetchQueue.removeAll()
+        backgroundPrefetchSeen.removeAll()
+        backgroundPrefetchBudget = 0
+        isBackgroundPrefetchScheduled = false
+        restorePersistedDirectoryCache(for: server)
     }
     
     private func appendDiagnostic(level: FTPDiagnosticLevel, title: String, message: String, suggestions: [String] = []) {
@@ -144,6 +205,24 @@ final class FTPManager: ObservableObject {
         DispatchQueue.main.async {
             self.recentConnections.removeAll { $0.id == item.id }
             self.persistRecentConnections()
+        }
+    }
+
+    func saveConnectionProfile(_ server: FTPServer, replacing id: UUID? = nil) {
+        let entry = FTPSavedConnection(id: id ?? UUID(), server: server)
+        DispatchQueue.main.async {
+            var updated = self.savedConnections.filter { $0.id != entry.id }
+            updated.insert(entry, at: 0)
+            updated.sort { $0.updatedAt > $1.updatedAt }
+            self.savedConnections = updated
+            self.persistSavedConnections()
+        }
+    }
+
+    func removeSavedConnection(_ item: FTPSavedConnection) {
+        DispatchQueue.main.async {
+            self.savedConnections.removeAll { $0.id == item.id }
+            self.persistSavedConnections()
         }
     }
     
@@ -359,17 +438,118 @@ final class FTPManager: ObservableObject {
         }
     }
     
-    func listDirectory() {
-        listDirectoryWithFallback()
+    func listDirectory(forceRefresh: Bool = false, targetPath: String? = nil) {
+        listDirectoryWithFallback(forceRefresh: forceRefresh, targetPath: targetPath)
     }
     
-    func listDirectoryWithFallback() {
+    private func publishDirectorySnapshot(path: String, items: [FTPItem], source: FTPDirectorySnapshot.Source, fetchedAt: Date = Date()) {
+        let sortedItems = sortDirectoryItems(items)
+        DispatchQueue.main.async {
+            self.currentDirectory = path
+            self.items = sortedItems
+            self.isUsingCachedListing = source == .cache
+            self.lastListingAt = fetchedAt
+        }
+    }
+
+    private func sortDirectoryItems(_ items: [FTPItem]) -> [FTPItem] {
+        items.sorted { lhs, rhs in
+            if lhs.isDirectory != rhs.isDirectory {
+                return lhs.isDirectory && !rhs.isDirectory
+            }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+    }
+
+    private func normalizedDirectoryPath(_ path: String) -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "/" }
+        if trimmed == "/" {
+            return "/"
+        }
+        let collapsed = trimmed.replacingOccurrences(of: "//", with: "/")
+        return collapsed.hasSuffix("/") ? String(collapsed.dropLast()) : collapsed
+    }
+
+    private func makeAbsolutePath(for name: String, in directory: String? = nil) -> String {
+        let baseDirectory = normalizedDirectoryPath(directory ?? currentDirectory)
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return baseDirectory }
+        if trimmed.hasPrefix("/") {
+            return normalizedDirectoryPath(trimmed)
+        }
+        if baseDirectory == "/" {
+            return "/\(trimmed)"
+        }
+        return "\(baseDirectory)/\(trimmed)"
+    }
+
+    private func cachedDirectoryListing(for path: String) -> CachedDirectoryListing? {
+        directoryCache[normalizedDirectoryPath(path)]
+    }
+
+    private func updateDirectoryCache(path: String, items: [FTPItem], fetchedAt: Date = Date()) {
+        let normalizedPath = normalizedDirectoryPath(path)
+        directoryCache[normalizedPath] = CachedDirectoryListing(items: sortDirectoryItems(items), fetchedAt: fetchedAt)
+        persistDirectoryCacheIfNeeded()
+    }
+
+    private func removeDirectoryCache(for path: String) {
+        directoryCache.removeValue(forKey: normalizedDirectoryPath(path))
+        persistDirectoryCacheIfNeeded()
+    }
+
+    private func mutateCurrentDirectoryCache(_ mutate: (inout [FTPItem]) -> Void) {
+        let currentPath = normalizedDirectoryPath(currentDirectory)
+        var currentItems = directoryCache[currentPath]?.items ?? items
+        mutate(&currentItems)
+        let now = Date()
+        let sorted = sortDirectoryItems(currentItems)
+        directoryCache[currentPath] = CachedDirectoryListing(items: sorted, fetchedAt: now)
+        persistDirectoryCacheIfNeeded()
+        publishDirectorySnapshot(path: currentPath, items: sorted, source: .cache, fetchedAt: now)
+    }
+
+    private func clearPendingNavigationIfNeeded(_ path: String) {
+        DispatchQueue.main.async {
+            if self.pendingNavigationPath == path {
+                self.pendingNavigationPath = nil
+            }
+        }
+    }
+
+    func listDirectoryWithFallback(forceRefresh: Bool = false, targetPath: String? = nil) {
         networkQueue.async {
-            guard !self.isListingInProgress else { return }
+            let targetPath = self.normalizedDirectoryPath(targetPath ?? self.currentDirectory)
+
+            if let cached = self.cachedDirectoryListing(for: targetPath) {
+                self.publishDirectorySnapshot(path: targetPath, items: cached.items, source: .cache, fetchedAt: cached.fetchedAt)
+                if !forceRefresh {
+                    self.setStatus("캐시된 디렉터리 목록을 즉시 표시했습니다: \(targetPath)")
+                    DispatchQueue.main.async {
+                        if self.pendingNavigationPath == targetPath {
+                            self.pendingNavigationPath = nil
+                        }
+                    }
+                    self.enqueueBackgroundPrefetch(paths: [targetPath], resetBudget: false)
+                    return
+                }
+            }
+
+            guard !self.isListingInProgress else {
+                if self.activeListingPath == targetPath {
+                    self.setStatus("이미 같은 폴더를 새로고침 중입니다: \(targetPath)")
+                }
+                return
+            }
             self.isListingInProgress = true
-            DispatchQueue.main.async { self.isAttemptRunning = true }
+            self.activeListingPath = targetPath
+            DispatchQueue.main.async {
+                self.isAttemptRunning = true
+            }
             defer {
                 self.isListingInProgress = false
+                self.activeListingPath = nil
                 DispatchQueue.main.async { self.isAttemptRunning = false }
             }
             
@@ -377,8 +557,11 @@ final class FTPManager: ObservableObject {
             
             self.drainPendingControlResponses(reason: "목록 조회 전 지연 응답 정리")
             let hasPinnedAttempt = self.successfulListAttempt != nil
+            let startedAt = Date()
             self.setStatus(hasPinnedAttempt ? "디렉터리 목록 가져오기 시작(성공한 설정 재사용)" : "디렉터리 목록 가져오기 시작(재시도 플랜)")
-            _ = self.sendCommandAndWait("TYPE A")
+            guard self.ensureTransferType("A") else {
+                return
+            }
             
             let attempts = self.makeListAttempts(for: server)
             self.setAttemptPlan(attempts.map(\.label))
@@ -387,9 +570,8 @@ final class FTPManager: ObservableObject {
                 self.setAttemptProgress(index: index, error: nil)
                 self.setStatus("재시도 \(index + 1)/\(attempts.count): \(attempt.label)")
                 
-                if self.runListAttempt(attempt: attempt, server: server) {
+                if self.runListAttempt(attempt: attempt, server: server, targetPath: targetPath, startedAt: startedAt) {
                     self.successfulListAttempt = attempt
-                    self.appendDiagnostic(level: .info, title: "목록 조회 성공", message: "이 서버는 \(attempt.label) 조합으로 동작했습니다.")
                     return
                 }
                 
@@ -410,13 +592,18 @@ final class FTPManager: ObservableObject {
                 ]
             )
             DispatchQueue.main.async {
-                self.connectionState = .error(err)
+                if self.connectionState == .connected {
+                    self.statusDetail = "목록 조회 실패: \(err)"
+                } else {
+                    self.connectionState = .error(err)
+                }
             }
+            self.clearPendingNavigationIfNeeded(targetPath)
         }
     }
     
     func retryLastListing() {
-        listDirectoryWithFallback()
+        listDirectoryWithFallback(forceRefresh: true)
     }
     
     private func makeListAttempts(for server: FTPServer) -> [(label: String, mode: String, command: String)] {
@@ -461,7 +648,12 @@ final class FTPManager: ObservableObject {
         }
     }
     
-    private func runListAttempt(attempt: (label: String, mode: String, command: String), server: FTPServer) -> Bool {
+    private func runListAttempt(
+        attempt: (label: String, mode: String, command: String),
+        server: FTPServer,
+        targetPath: String,
+        startedAt: Date
+    ) -> Bool {
         guard let modeResponse = sendCommandAndWait(attempt.mode) else {
             setLastAttemptError("\(attempt.mode) 응답 타임아웃")
             return false
@@ -509,8 +701,16 @@ final class FTPManager: ObservableObject {
             parsed = parseDirectoryListing(dataListing)
         }
         
+        let finishedAt = Date()
+        updateDirectoryCache(path: targetPath, items: parsed, fetchedAt: finishedAt)
+        publishDirectorySnapshot(path: targetPath, items: parsed, source: .remote, fetchedAt: finishedAt)
+        clearPendingNavigationIfNeeded(targetPath)
+        enqueueBackgroundPrefetch(
+            paths: parsed.filter(\.isDirectory).map { makeAbsolutePath(for: $0.name, in: targetPath) },
+            resetBudget: backgroundPrefetchBudget == 0
+        )
         DispatchQueue.main.async {
-            self.items = parsed
+            self.lastListingDuration = finishedAt.timeIntervalSince(startedAt)
         }
         return true
     }
@@ -574,9 +774,77 @@ final class FTPManager: ObservableObject {
         
         return listing
     }
+
+    private func fetchDirectoryItemsSilently(path: String, server: FTPServer) -> [FTPItem]? {
+        let targetPath = normalizedDirectoryPath(path)
+        if let cached = cachedDirectoryListing(for: targetPath), cached.isFresh {
+            return cached.items
+        }
+
+        drainPendingControlResponses(
+            reason: "백그라운드 캐시 전 지연 응답 정리",
+            timeoutSeconds: 0.02
+        )
+        guard ensureTransferType("A") else { return nil }
+
+        let hadPinnedAttempt = successfulListAttempt != nil
+        let attempts = makeListAttempts(for: server)
+        for attempt in attempts {
+            if let items = runSilentListAttempt(attempt: attempt, server: server, targetPath: targetPath) {
+                successfulListAttempt = attempt
+                return items
+            }
+            if hadPinnedAttempt {
+                break
+            }
+        }
+        return nil
+    }
+
+    private func runSilentListAttempt(
+        attempt: (label: String, mode: String, command: String),
+        server: FTPServer,
+        targetPath: String
+    ) -> [FTPItem]? {
+        guard let modeResponse = sendCommandAndWait(attempt.mode) else { return nil }
+
+        let endpoint: (host: String, port: Int)?
+        if attempt.mode == "EPSV" {
+            guard modeResponse.hasPrefix("229") else { return nil }
+            endpoint = parseEPSVEndpoint(from: modeResponse, controlHost: server.host)
+        } else {
+            guard modeResponse.hasPrefix("227") else { return nil }
+            endpoint = parsePASVEndpoint(from: modeResponse, server: server)
+        }
+
+        guard let endpoint else { return nil }
+        let pathAwareCommand = targetPath == "/" ? attempt.command : "\(attempt.command) \(targetPath)"
+        guard let dataListing = performDataCommand(
+            pathAwareCommand,
+            host: endpoint.host,
+            port: endpoint.port,
+            secure: server.encryptionMode == .explicitTLS && usesPrivateDataProtection,
+            timeout: min(server.options.timeoutSeconds, 6)
+        ) else {
+            return nil
+        }
+
+        let parsed: [FTPItem]
+        switch attempt.command {
+        case "MLSD":
+            parsed = parseMLSD(dataListing)
+        case "NLST":
+            parsed = parseNameList(dataListing)
+        default:
+            parsed = parseDirectoryListing(dataListing)
+        }
+        let finishedAt = Date()
+        updateDirectoryCache(path: targetPath, items: parsed, fetchedAt: finishedAt)
+        return parsed
+    }
     
-    private func refreshCurrentDirectory() {
-        guard let response = sendCommandAndWait("PWD") else { return }
+    private func refreshCurrentDirectory() -> String? {
+        guard let response = sendCommandAndWait("PWD") else { return nil }
         let cleaned = response.trimmingCharacters(in: .whitespacesAndNewlines)
         setStatus("PWD 응답: \(cleaned)")
         if response.hasPrefix("257"),
@@ -586,7 +854,9 @@ final class FTPManager: ObservableObject {
             DispatchQueue.main.async {
                 self.currentDirectory = path
             }
+            return path
         }
+        return nil
     }
     
     private func checkFeatureContains(_ token: String) -> Bool {
@@ -628,37 +898,74 @@ final class FTPManager: ObservableObject {
     private func drainPendingControlResponses(
         reason: String,
         acceptedPrefixes: [String] = ["226", "250"],
-        timeoutSeconds: TimeInterval = 0.35
+        timeoutSeconds: TimeInterval = 0.08
     ) {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
+        var sawIncomingBytes = false
         
         while Date() < deadline {
-            if let parsed = parseFTPResponse(from: &controlReceiveBuffer) {
+            if let parsed = parseFTPResponse(from: &controlReceiveBuffer, consume: false) {
                 let cleaned = parsed.trimmingCharacters(in: .whitespacesAndNewlines)
                 if acceptedPrefixes.contains(where: { parsed.hasPrefix($0) }) {
+                    _ = parseFTPResponse(from: &controlReceiveBuffer)
                     setStatus("\(reason): \(cleaned)")
                     continue
-                }
-                if let data = parsed.data(using: .utf8) {
-                    controlReceiveBuffer.insert(contentsOf: data, at: 0)
                 }
                 return
             }
             
             guard let input = controlInputStream else { return }
             guard input.hasBytesAvailable else {
-                Thread.sleep(forTimeInterval: 0.05)
+                if !sawIncomingBytes {
+                    return
+                }
+                Thread.sleep(forTimeInterval: Self.pollSleepActive)
                 continue
             }
             
             var buffer = [UInt8](repeating: 0, count: 4096)
             let count = input.read(&buffer, maxLength: buffer.count)
             if count > 0 {
+                sawIncomingBytes = true
                 controlReceiveBuffer.append(buffer, count: count)
                 continue
             }
             return
         }
+    }
+
+    private func ensureTransferType(_ type: String) -> Bool {
+        if currentTransferType == type {
+            return true
+        }
+        guard let response = sendCommandAndWait("TYPE \(type)") else {
+            setLastAttemptError("TYPE \(type) 응답 타임아웃")
+            return false
+        }
+        let cleaned = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard response.hasPrefix("200") else {
+            setLastAttemptError("TYPE \(type) 실패: \(cleaned)")
+            return false
+        }
+        currentTransferType = type
+        return true
+    }
+
+    private func receiveNavigationResponse(timeoutSeconds: Int, commandName: String) -> String? {
+        let deadline = Date().addingTimeInterval(TimeInterval(timeoutSeconds))
+
+        while Date() < deadline {
+            guard let response = receiveControlResponse(timeoutSeconds: max(1, Int(ceil(deadline.timeIntervalSinceNow)))) else {
+                return nil
+            }
+            let cleaned = response.trimmingCharacters(in: .whitespacesAndNewlines)
+            if response.hasPrefix("226") {
+                setStatus("\(commandName) 전 지연 완료 응답 무시: \(cleaned)")
+                continue
+            }
+            return response
+        }
+        return nil
     }
     
     private func openControlConnection(host: String, port: Int, timeout: Int) -> Bool {
@@ -719,7 +1026,7 @@ final class FTPManager: ObservableObject {
                         setStatus("명령 전송 타임아웃: \(command)")
                         return false
                     }
-                    Thread.sleep(forTimeInterval: 0.05)
+                    Thread.sleep(forTimeInterval: Self.pollSleepIdle)
                 }
             }
             return true
@@ -752,13 +1059,17 @@ final class FTPManager: ObservableObject {
                 }
             }
             
-            Thread.sleep(forTimeInterval: 0.05)
+            Thread.sleep(forTimeInterval: Self.pollSleepIdle)
         }
         
         return parseFTPResponse(from: &controlReceiveBuffer)
     }
     
     private func parseFTPResponse(from buffer: inout Data) -> String? {
+        parseFTPResponse(from: &buffer, consume: true)
+    }
+
+    private func parseFTPResponse(from buffer: inout Data, consume: Bool) -> String? {
         guard let text = String(data: buffer, encoding: .utf8), text.contains("\r\n") else { return nil }
         let lines = text.components(separatedBy: "\r\n")
         guard let first = lines.first, first.count >= 4 else { return nil }
@@ -770,8 +1081,10 @@ final class FTPManager: ObservableObject {
             for (index, line) in lines.enumerated() where index > 0 {
                 if line.hasPrefix(code + " ") {
                     let response = lines[0...index].joined(separator: "\r\n") + "\r\n"
-                    let count = response.data(using: .utf8)?.count ?? 0
-                    buffer.removeFirst(min(count, buffer.count))
+                    if consume {
+                        let count = response.data(using: .utf8)?.count ?? 0
+                        buffer.removeFirst(min(count, buffer.count))
+                    }
                     return response
                 }
             }
@@ -780,8 +1093,10 @@ final class FTPManager: ObservableObject {
         
         guard let range = text.range(of: "\r\n") else { return nil }
         let response = String(text[..<range.upperBound])
-        let count = response.data(using: .utf8)?.count ?? 0
-        buffer.removeFirst(min(count, buffer.count))
+        if consume {
+            let count = response.data(using: .utf8)?.count ?? 0
+            buffer.removeFirst(min(count, buffer.count))
+        }
         return response
     }
     
@@ -823,7 +1138,7 @@ final class FTPManager: ObservableObject {
             if input.streamStatus == .error || output.streamStatus == .error {
                 break
             }
-            Thread.sleep(forTimeInterval: 0.05)
+            Thread.sleep(forTimeInterval: Self.pollSleepIdle)
         }
         
         closeStreamPair((input, output))
@@ -938,9 +1253,9 @@ final class FTPManager: ObservableObject {
             }
             
             if sawBytes {
-                Thread.sleep(forTimeInterval: 0.05)
+                Thread.sleep(forTimeInterval: sawBytes ? Self.pollSleepActive : Self.pollSleepIdle)
             } else {
-                Thread.sleep(forTimeInterval: 0.1)
+                Thread.sleep(forTimeInterval: Self.pollSleepIdle)
             }
         }
         
@@ -1054,11 +1369,22 @@ final class FTPManager: ObservableObject {
         networkQueue.async {
             let normalizedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !normalizedPath.isEmpty else { return }
+            let requestedPath = self.makeAbsolutePath(for: normalizedPath)
+            self.backgroundPrefetchQueue.removeAll()
+            self.backgroundPrefetchBudget = 0
+            DispatchQueue.main.async {
+                self.pendingNavigationPath = requestedPath
+            }
             
             if let lastRequest = self.lastDirectoryChangeRequest,
                lastRequest.path == normalizedPath,
                Date().timeIntervalSince(lastRequest.date) < 1.0 {
                 self.setStatus("같은 디렉터리 열기 요청을 무시합니다: \(normalizedPath)")
+                DispatchQueue.main.async {
+                    if self.pendingNavigationPath == requestedPath {
+                        self.pendingNavigationPath = nil
+                    }
+                }
                 return
             }
             self.lastDirectoryChangeRequest = (normalizedPath, Date())
@@ -1066,17 +1392,48 @@ final class FTPManager: ObservableObject {
             
             guard self.pendingDirectoryChange != normalizedPath else {
                 self.setStatus("같은 디렉터리 이동 요청이 이미 진행 중입니다: \(normalizedPath)")
+                DispatchQueue.main.async {
+                    if self.pendingNavigationPath == requestedPath {
+                        self.pendingNavigationPath = nil
+                    }
+                }
                 return
             }
             self.pendingDirectoryChange = normalizedPath
             defer { self.pendingDirectoryChange = nil }
             
-            guard let response = self.sendCommandAndWait("CWD \(normalizedPath)") else { return }
+            guard self.writeCommand("CWD \(normalizedPath)") else {
+                DispatchQueue.main.async {
+                    if self.pendingNavigationPath == requestedPath {
+                        self.pendingNavigationPath = nil
+                    }
+                }
+                return
+            }
+            guard let response = self.receiveNavigationResponse(
+                timeoutSeconds: self.currentServer?.options.timeoutSeconds ?? 10,
+                commandName: "CWD"
+            ) else {
+                DispatchQueue.main.async {
+                    if self.pendingNavigationPath == requestedPath {
+                        self.pendingNavigationPath = nil
+                    }
+                }
+                return
+            }
             self.setStatus("CWD 응답: \(response.trimmingCharacters(in: .whitespacesAndNewlines))")
             if response.hasPrefix("250") {
-                self.refreshCurrentDirectory()
-                self.listDirectory()
+                let refreshedPath = self.normalizedDirectoryPath(requestedPath)
+                if let cached = self.cachedDirectoryListing(for: refreshedPath) {
+                    self.publishDirectorySnapshot(path: refreshedPath, items: cached.items, source: .cache, fetchedAt: cached.fetchedAt)
+                }
+                self.listDirectory(forceRefresh: self.cachedDirectoryListing(for: refreshedPath) == nil, targetPath: refreshedPath)
             } else {
+                DispatchQueue.main.async {
+                    if self.pendingNavigationPath == requestedPath {
+                        self.pendingNavigationPath = nil
+                    }
+                }
                 self.appendDiagnostic(
                     level: .warning,
                     title: "디렉터리 이동 실패",
@@ -1089,8 +1446,33 @@ final class FTPManager: ObservableObject {
     
     func goToParentDirectory() {
         networkQueue.async {
-            guard let response = self.sendCommandAndWait("CDUP"), response.hasPrefix("250") else { return }
-            self.listDirectory()
+            let requestedPath = self.normalizedDirectoryPath((self.currentDirectory as NSString).deletingLastPathComponent.isEmpty ? "/" : (self.currentDirectory as NSString).deletingLastPathComponent)
+            self.backgroundPrefetchQueue.removeAll()
+            self.backgroundPrefetchBudget = 0
+            DispatchQueue.main.async {
+                self.pendingNavigationPath = requestedPath
+            }
+            guard self.writeCommand("CDUP") else {
+                DispatchQueue.main.async {
+                    if self.pendingNavigationPath == requestedPath {
+                        self.pendingNavigationPath = nil
+                    }
+                }
+                return
+            }
+            guard let response = self.receiveNavigationResponse(
+                timeoutSeconds: self.currentServer?.options.timeoutSeconds ?? 10,
+                commandName: "CDUP"
+            ), response.hasPrefix("250") else {
+                DispatchQueue.main.async {
+                    if self.pendingNavigationPath == requestedPath {
+                        self.pendingNavigationPath = nil
+                    }
+                }
+                return
+            }
+            let refreshedPath = self.normalizedDirectoryPath(self.refreshCurrentDirectory() ?? requestedPath)
+            self.listDirectory(forceRefresh: false, targetPath: refreshedPath)
         }
     }
     
@@ -1105,8 +1487,13 @@ final class FTPManager: ObservableObject {
             switch result {
             case .success(let data):
                 if self.writeRemoteFile(remotePath: remotePath, data: data) {
+                    let fileName = URL(fileURLWithPath: remotePath).lastPathComponent
+                    self.mutateCurrentDirectoryCache { items in
+                        items.removeAll { $0.name == fileName }
+                        items.append(FTPItem(name: fileName, isDirectory: false, size: Int64(data.count)))
+                    }
                     self.finishOperation(operation.id)
-                    self.listDirectory()
+                    self.listDirectory(forceRefresh: true)
                 } else {
                     self.failOperation(operation.id, message: self.lastAttemptError ?? "업로드에 실패했습니다.")
                 }
@@ -1116,29 +1503,51 @@ final class FTPManager: ObservableObject {
         }
     }
     
-    func downloadFile(remotePath: String, localPath: String) {
-        let operation = FTPOperation(type: .download, localPath: localPath, remotePath: remotePath, state: .downloading)
+    func downloadFile(remotePath: String, destinationURL: URL, securityScopedAccessURL: URL? = nil) {
+        let operation = FTPOperation(type: .download, localPath: destinationURL.path, remotePath: remotePath, state: .downloading)
         DispatchQueue.main.async {
             self.operations.append(operation)
         }
         
         networkQueue.async {
+            let accessURL = securityScopedAccessURL ?? destinationURL
+            let didStartAccessing = accessURL.startAccessingSecurityScopedResource()
+            defer {
+                if didStartAccessing {
+                    accessURL.stopAccessingSecurityScopedResource()
+                }
+            }
+
             guard let data = self.readRemoteFile(remotePath: remotePath) else {
                 self.failOperation(operation.id, message: self.lastAttemptError ?? "다운로드에 실패했습니다.")
                 return
             }
             
             do {
-                try data.write(to: URL(fileURLWithPath: localPath), options: .atomic)
+                let parentDirectory = destinationURL.deletingLastPathComponent()
+                try FileManager.default.createDirectory(at: parentDirectory, withIntermediateDirectories: true)
+                try data.write(to: destinationURL, options: .atomic)
                 self.finishOperation(operation.id)
             } catch {
                 self.failOperation(operation.id, message: error.localizedDescription)
             }
         }
     }
+
+    func downloadFile(remotePath: String, localPath: String) {
+        downloadFile(remotePath: remotePath, destinationURL: URL(fileURLWithPath: localPath))
+    }
     
     func loadTextFile(named fileName: String, completion: @escaping (Result<String, Error>) -> Void) {
         networkQueue.async {
+            let cacheKey = self.makeAbsolutePath(for: fileName)
+            if let cached = self.textFileCache[cacheKey], cached.isFresh {
+                DispatchQueue.main.async {
+                    completion(.success(cached.content))
+                }
+                return
+            }
+
             guard let data = self.readRemoteFile(remotePath: fileName) else {
                 let message = self.lastAttemptError ?? "파일 내용을 가져오지 못했습니다."
                 DispatchQueue.main.async {
@@ -1154,8 +1563,25 @@ final class FTPManager: ObservableObject {
                 return
             }
             
+            self.textFileCache[cacheKey] = CachedTextFile(content: text, fetchedAt: Date())
             DispatchQueue.main.async {
                 completion(.success(text))
+            }
+        }
+    }
+
+    func fetchRemoteFileData(named fileName: String, completion: @escaping (Result<Data, Error>) -> Void) {
+        networkQueue.async {
+            guard let data = self.readRemoteFile(remotePath: fileName) else {
+                let message = self.lastAttemptError ?? "파일 다운로드 준비에 실패했습니다."
+                DispatchQueue.main.async {
+                    completion(.failure(NSError(domain: "FTPManager", code: 9, userInfo: [NSLocalizedDescriptionKey: message])))
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                completion(.success(data))
             }
         }
     }
@@ -1176,8 +1602,14 @@ final class FTPManager: ObservableObject {
             }
             
             if self.writeRemoteFile(remotePath: fileName, data: data) {
+                let cacheKey = self.makeAbsolutePath(for: fileName)
+                self.textFileCache[cacheKey] = CachedTextFile(content: content, fetchedAt: Date())
+                self.mutateCurrentDirectoryCache { items in
+                    items.removeAll { $0.name == fileName }
+                    items.append(FTPItem(name: fileName, isDirectory: false, size: Int64(data.count)))
+                }
                 self.finishOperation(operation.id)
-                self.listDirectory()
+                self.listDirectory(forceRefresh: true)
                 DispatchQueue.main.async {
                     completion(.success(()))
                 }
@@ -1193,22 +1625,121 @@ final class FTPManager: ObservableObject {
     
     func deleteItem(_ path: String, isDirectory: Bool) {
         let operation = FTPOperation(type: .delete, localPath: nil, remotePath: path)
-        operations.append(operation)
+        DispatchQueue.main.async {
+            self.operations.append(operation)
+            self.items.removeAll { $0.name == path }
+        }
         networkQueue.async {
+            let cachedSnapshot = self.cachedDirectoryListing(for: self.currentDirectory)
             let command = isDirectory ? "RMD \(path)" : "DELE \(path)"
-            guard let response = self.sendCommandAndWait(command) else { return }
+            guard let response = self.sendCommandAndWait(command) else {
+                if let cachedSnapshot {
+                    self.publishDirectorySnapshot(path: self.currentDirectory, items: cachedSnapshot.items, source: .cache, fetchedAt: cachedSnapshot.fetchedAt)
+                }
+                self.failOperation(operation.id, message: self.lastAttemptError ?? "삭제 응답을 받지 못했습니다.")
+                return
+            }
             if response.hasPrefix("250") || response.hasPrefix("200") {
-                self.listDirectory()
+                self.mutateCurrentDirectoryCache { items in
+                    items.removeAll { $0.name == path }
+                }
+                self.textFileCache.removeValue(forKey: self.makeAbsolutePath(for: path))
+                self.finishOperation(operation.id)
+                self.listDirectory(forceRefresh: true)
+            } else {
+                if let cachedSnapshot {
+                    self.publishDirectorySnapshot(path: self.currentDirectory, items: cachedSnapshot.items, source: .cache, fetchedAt: cachedSnapshot.fetchedAt)
+                }
+                self.failOperation(operation.id, message: response.trimmingCharacters(in: .whitespacesAndNewlines))
             }
         }
     }
     
     func createDirectory(_ name: String) {
         let operation = FTPOperation(type: .createDirectory, localPath: nil, remotePath: name)
-        operations.append(operation)
+        DispatchQueue.main.async {
+            self.operations.append(operation)
+        }
         networkQueue.async {
-            guard let response = self.sendCommandAndWait("MKD \(name)"), response.hasPrefix("257") else { return }
-            self.listDirectory()
+            guard let response = self.sendCommandAndWait("MKD \(name)") else {
+                self.failOperation(operation.id, message: self.lastAttemptError ?? "폴더 생성 응답을 받지 못했습니다.")
+                return
+            }
+            guard response.hasPrefix("257") else {
+                self.failOperation(operation.id, message: response.trimmingCharacters(in: .whitespacesAndNewlines))
+                return
+            }
+            self.mutateCurrentDirectoryCache { items in
+                items.removeAll { $0.name == name }
+                items.append(FTPItem(name: name, isDirectory: true))
+            }
+            self.finishOperation(operation.id)
+            self.listDirectory(forceRefresh: true)
+        }
+    }
+
+    func renameItem(from oldName: String, to newName: String, isDirectory: Bool, completion: ((Result<Void, Error>) -> Void)? = nil) {
+        let trimmedNewName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedNewName.isEmpty else {
+            DispatchQueue.main.async {
+                completion?(.failure(NSError(domain: "FTPManager", code: 5, userInfo: [NSLocalizedDescriptionKey: "새 이름이 비어 있습니다."])))
+            }
+            return
+        }
+
+        let operation = FTPOperation(type: .rename, localPath: nil, remotePath: oldName, state: .creating)
+        DispatchQueue.main.async {
+            self.operations.append(operation)
+        }
+
+        networkQueue.async {
+            guard let renameFrom = self.sendCommandAndWait("RNFR \(oldName)") else {
+                let message = self.lastAttemptError ?? "이름 변경 시작 응답을 받지 못했습니다."
+                self.failOperation(operation.id, message: message)
+                DispatchQueue.main.async {
+                    completion?(.failure(NSError(domain: "FTPManager", code: 6, userInfo: [NSLocalizedDescriptionKey: message])))
+                }
+                return
+            }
+            guard renameFrom.hasPrefix("350") else {
+                let message = renameFrom.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.failOperation(operation.id, message: message)
+                DispatchQueue.main.async {
+                    completion?(.failure(NSError(domain: "FTPManager", code: 7, userInfo: [NSLocalizedDescriptionKey: message])))
+                }
+                return
+            }
+
+            guard let renameTo = self.sendCommandAndWait("RNTO \(trimmedNewName)"), renameTo.hasPrefix("250") else {
+                let message = self.lastAttemptError ?? "이름 변경 완료에 실패했습니다."
+                self.failOperation(operation.id, message: message)
+                DispatchQueue.main.async {
+                    completion?(.failure(NSError(domain: "FTPManager", code: 8, userInfo: [NSLocalizedDescriptionKey: message])))
+                }
+                return
+            }
+
+            self.mutateCurrentDirectoryCache { items in
+                items.removeAll { $0.name == oldName }
+                items.append(FTPItem(name: trimmedNewName, isDirectory: isDirectory))
+            }
+            let oldCacheKey = self.makeAbsolutePath(for: oldName)
+            let newCacheKey = self.makeAbsolutePath(for: trimmedNewName)
+            if let cachedText = self.textFileCache.removeValue(forKey: oldCacheKey) {
+                self.textFileCache[newCacheKey] = cachedText
+            }
+            if isDirectory {
+                let oldDirectoryPath = self.makeAbsolutePath(for: oldName)
+                let newDirectoryPath = self.makeAbsolutePath(for: trimmedNewName)
+                if let childCache = self.directoryCache.removeValue(forKey: oldDirectoryPath) {
+                    self.directoryCache[newDirectoryPath] = childCache
+                }
+            }
+            self.finishOperation(operation.id)
+            self.listDirectory(forceRefresh: true)
+            DispatchQueue.main.async {
+                completion?(.success(()))
+            }
         }
     }
     
@@ -1220,7 +1751,13 @@ final class FTPManager: ObservableObject {
                 self.connectionState = .disconnected
                 self.items = []
                 self.currentDirectory = "/"
+                self.isUsingCachedListing = false
+                self.lastListingAt = nil
+                self.lastListingDuration = nil
+                self.pendingNavigationPath = nil
             }
+            self.directoryCache.removeAll()
+            self.textFileCache.removeAll()
         }
     }
     
@@ -1232,6 +1769,7 @@ final class FTPManager: ObservableObject {
         controlOutputStream = nil
         controlReceiveBuffer = Data()
         usesPrivateDataProtection = false
+        currentTransferType = nil
     }
 
     private func transferModeSequence(for server: FTPServer) -> [String] {
@@ -1298,7 +1836,7 @@ final class FTPManager: ObservableObject {
     private func readRemoteFile(remotePath: String) -> Data? {
         guard let server = currentServer else { return nil }
         drainPendingControlResponses(reason: "파일 읽기 전 지연 응답 정리")
-        _ = sendCommandAndWait("TYPE I")
+        guard ensureTransferType("I") else { return nil }
         
         guard let (streams, mode) = openDataStreams(for: server) else { return nil }
         defer { closeStreamPair(streams) }
@@ -1315,8 +1853,21 @@ final class FTPManager: ObservableObject {
             return nil
         }
         
-        let data = readAllData(from: streams.input, timeoutSeconds: server.options.timeoutSeconds)
+        let dataResult = readAllData(from: streams.input, timeoutSeconds: server.options.timeoutSeconds)
+        guard let dataResult else {
+            setLastAttemptError("RETR 데이터 수신 실패")
+            return nil
+        }
+
         guard let finalResponse = receiveControlResponse(timeoutSeconds: server.options.timeoutSeconds) else {
+            if dataResult.receivedBytes || dataResult.didReachEnd {
+                setStatus("RETR 완료 응답을 받지 못했지만 파일 데이터를 모두 받아 성공으로 간주합니다.")
+                drainPendingControlResponses(reason: "RETR 지연 완료 응답 정리", acceptedPrefixes: ["226", "250"])
+                if successfulListAttempt == nil {
+                    successfulListAttempt = ("\(mode) + LIST", mode, "LIST")
+                }
+                return dataResult.data
+            }
             setLastAttemptError("RETR 완료 응답 타임아웃")
             return nil
         }
@@ -1324,6 +1875,14 @@ final class FTPManager: ObservableObject {
         let cleanedFinal = finalResponse.trimmingCharacters(in: .whitespacesAndNewlines)
         setStatus("RETR 완료 응답: \(cleanedFinal)")
         guard finalResponse.hasPrefix("226") || finalResponse.hasPrefix("250") else {
+            if dataResult.receivedBytes || dataResult.didReachEnd {
+                setStatus("RETR 완료 응답이 비정상이지만 파일 데이터를 모두 받아 성공으로 간주합니다: \(cleanedFinal)")
+                drainPendingControlResponses(reason: "RETR 추가 지연 응답 정리", acceptedPrefixes: ["226", "250"])
+                if successfulListAttempt == nil {
+                    successfulListAttempt = ("\(mode) + LIST", mode, "LIST")
+                }
+                return dataResult.data
+            }
             setLastAttemptError("RETR 완료 응답 오류: \(cleanedFinal)")
             return nil
         }
@@ -1331,13 +1890,13 @@ final class FTPManager: ObservableObject {
         if successfulListAttempt == nil {
             successfulListAttempt = ("\(mode) + LIST", mode, "LIST")
         }
-        return data
+        return dataResult.data
     }
     
     private func writeRemoteFile(remotePath: String, data: Data) -> Bool {
         guard let server = currentServer else { return false }
         drainPendingControlResponses(reason: "파일 저장 전 지연 응답 정리")
-        _ = sendCommandAndWait("TYPE I")
+        guard ensureTransferType("I") else { return false }
         
         guard let (streams, mode) = openDataStreams(for: server) else { return false }
         defer { closeStreamPair(streams) }
@@ -1361,15 +1920,27 @@ final class FTPManager: ObservableObject {
         streams.output.close()
         
         guard let finalResponse = receiveControlResponse(timeoutSeconds: server.options.timeoutSeconds) else {
-            setLastAttemptError("STOR 완료 응답 타임아웃")
-            return false
+            setStatus("STOR 완료 응답을 받지 못했지만 데이터 전송이 끝나 성공으로 간주합니다.")
+            drainPendingControlResponses(reason: "STOR 지연 완료 응답 정리", acceptedPrefixes: ["226", "250"])
+            if successfulListAttempt == nil {
+                successfulListAttempt = ("\(mode) + LIST", mode, "LIST")
+            }
+            return true
         }
         
         let cleanedFinal = finalResponse.trimmingCharacters(in: .whitespacesAndNewlines)
         setStatus("STOR 완료 응답: \(cleanedFinal)")
         guard finalResponse.hasPrefix("226") || finalResponse.hasPrefix("250") else {
-            setLastAttemptError("STOR 완료 응답 오류: \(cleanedFinal)")
-            return false
+            if cleanedFinal.hasPrefix("425") || cleanedFinal.hasPrefix("426") || cleanedFinal.hasPrefix("450") || cleanedFinal.hasPrefix("451") || cleanedFinal.hasPrefix("552") {
+                setLastAttemptError("STOR 완료 응답 오류: \(cleanedFinal)")
+                return false
+            }
+            setStatus("STOR 완료 응답이 비정상이지만 데이터 전송이 끝나 성공으로 간주합니다: \(cleanedFinal)")
+            drainPendingControlResponses(reason: "STOR 추가 지연 응답 정리", acceptedPrefixes: ["226", "250"])
+            if successfulListAttempt == nil {
+                successfulListAttempt = ("\(mode) + LIST", mode, "LIST")
+            }
+            return true
         }
         
         if successfulListAttempt == nil {
@@ -1378,9 +1949,11 @@ final class FTPManager: ObservableObject {
         return true
     }
     
-    private func readAllData(from input: InputStream, timeoutSeconds: Int) -> Data? {
+    private func readAllData(from input: InputStream, timeoutSeconds: Int) -> (data: Data, didReachEnd: Bool, receivedBytes: Bool)? {
         var data = Data()
         let deadline = Date().addingTimeInterval(TimeInterval(timeoutSeconds))
+        var sawBytes = false
+        var reachedEnd = false
         
         while Date() < deadline {
             if input.hasBytesAvailable {
@@ -1388,20 +1961,120 @@ final class FTPManager: ObservableObject {
                 let count = input.read(&buffer, maxLength: buffer.count)
                 if count > 0 {
                     data.append(buffer, count: count)
+                    sawBytes = true
                     continue
                 }
-                if count == 0 { return data }
+                if count == 0 {
+                    reachedEnd = true
+                    return (data, reachedEnd, sawBytes)
+                }
                 return nil
             }
             
             if input.streamStatus == .atEnd || input.streamStatus == .closed {
-                return data
+                reachedEnd = true
+                return (data, reachedEnd, sawBytes)
             }
             
-            Thread.sleep(forTimeInterval: 0.05)
+            Thread.sleep(forTimeInterval: sawBytes ? Self.pollSleepActive : Self.pollSleepIdle)
         }
         
-        return data.isEmpty ? nil : data
+        guard sawBytes else { return nil }
+        return (data, reachedEnd, sawBytes)
+    }
+
+    private func enqueueBackgroundPrefetch(paths: [String], resetBudget: Bool) {
+        guard currentServer != nil else { return }
+        if resetBudget || backgroundPrefetchBudget == 0 {
+            backgroundPrefetchBudget = Self.backgroundPrefetchLimit
+        }
+
+        for rawPath in paths {
+            let normalized = normalizedDirectoryPath(rawPath)
+            guard backgroundPrefetchSeen.insert(normalized).inserted else { continue }
+            backgroundPrefetchQueue.append(normalized)
+        }
+        scheduleBackgroundPrefetchIfNeeded()
+    }
+
+    private func scheduleBackgroundPrefetchIfNeeded() {
+        guard !isBackgroundPrefetchScheduled, !backgroundPrefetchQueue.isEmpty else { return }
+        isBackgroundPrefetchScheduled = true
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.25) {
+            self.networkQueue.async {
+                self.isBackgroundPrefetchScheduled = false
+                self.performNextBackgroundPrefetch()
+            }
+        }
+    }
+
+    private func performNextBackgroundPrefetch() {
+        guard backgroundPrefetchBudget > 0 else { return }
+        guard !isListingInProgress, pendingDirectoryChange == nil, !isBackgroundPrefetchRunning else {
+            scheduleBackgroundPrefetchIfNeeded()
+            return
+        }
+        guard let server = currentServer else { return }
+        guard let nextPath = backgroundPrefetchQueue.first else { return }
+        backgroundPrefetchQueue.removeFirst()
+        backgroundPrefetchBudget -= 1
+        isBackgroundPrefetchRunning = true
+        defer { isBackgroundPrefetchRunning = false }
+
+        if let items = fetchDirectoryItemsSilently(path: nextPath, server: server) {
+            let childPaths = items.filter(\.isDirectory).map { makeAbsolutePath(for: $0.name, in: nextPath) }
+            for childPath in childPaths {
+                let normalized = normalizedDirectoryPath(childPath)
+                if backgroundPrefetchSeen.insert(normalized).inserted {
+                    backgroundPrefetchQueue.append(normalized)
+                }
+            }
+        }
+
+        if !backgroundPrefetchQueue.isEmpty && backgroundPrefetchBudget > 0 {
+            scheduleBackgroundPrefetchIfNeeded()
+        }
+    }
+
+    private func persistedDirectoryCacheKey(for server: FTPServer) -> String {
+        let raw = [
+            server.host.lowercased(),
+            String(server.port),
+            server.username.lowercased(),
+            server.encryptionMode.rawValue,
+            server.logonType.rawValue
+        ].joined(separator: "|")
+        let safe = raw.replacingOccurrences(of: "[^A-Za-z0-9|._-]", with: "_", options: .regularExpression)
+        return Self.persistedDirectoryCachePrefix + safe
+    }
+
+    private func restorePersistedDirectoryCache(for server: FTPServer) {
+        let key = persistedDirectoryCacheKey(for: server)
+        guard let data = UserDefaults.standard.data(forKey: key) else { return }
+        guard let decoded = try? JSONDecoder().decode([PersistedDirectoryCacheEntry].self, from: data) else { return }
+
+        let filtered = decoded.filter {
+            Date().timeIntervalSince($0.fetchedAt) < Self.persistedDirectoryCacheTTL
+        }
+        directoryCache = Dictionary(
+            uniqueKeysWithValues: filtered.map {
+                ($0.path, CachedDirectoryListing(items: sortDirectoryItems($0.items), fetchedAt: $0.fetchedAt))
+            }
+        )
+    }
+
+    private func persistDirectoryCacheIfNeeded() {
+        guard let server = currentServer else { return }
+        let key = persistedDirectoryCacheKey(for: server)
+        let entries = directoryCache
+            .map { path, listing in
+                PersistedDirectoryCacheEntry(path: path, items: listing.items, fetchedAt: listing.fetchedAt)
+            }
+            .sorted { $0.fetchedAt > $1.fetchedAt }
+            .prefix(Self.persistedDirectoryCacheLimit)
+
+        guard let data = try? JSONEncoder().encode(Array(entries)) else { return }
+        UserDefaults.standard.set(data, forKey: key)
     }
     
     private func writeAll(_ data: Data, to output: OutputStream, timeoutSeconds: Int) -> Bool {
@@ -1425,7 +2098,7 @@ final class FTPManager: ObservableObject {
                     if Date() > deadline {
                         return false
                     }
-                    Thread.sleep(forTimeInterval: 0.05)
+                    Thread.sleep(forTimeInterval: Self.pollSleepIdle)
                 }
             }
             return true
@@ -1517,6 +2190,25 @@ final class FTPManager: ObservableObject {
             UserDefaults.standard.set(data, forKey: Self.recentConnectionsKey)
         } catch {
             print("최근 접속 이력 저장 실패: \(error)")
+        }
+    }
+
+    private func loadSavedConnections() {
+        guard let data = UserDefaults.standard.data(forKey: Self.savedConnectionsKey) else { return }
+        do {
+            let decoded = try JSONDecoder().decode([FTPSavedConnection].self, from: data)
+            savedConnections = decoded.sorted { $0.updatedAt > $1.updatedAt }
+        } catch {
+            print("저장된 접속정보 로드 실패: \(error)")
+        }
+    }
+
+    private func persistSavedConnections() {
+        do {
+            let data = try JSONEncoder().encode(savedConnections)
+            UserDefaults.standard.set(data, forKey: Self.savedConnectionsKey)
+        } catch {
+            print("저장된 접속정보 저장 실패: \(error)")
         }
     }
 }

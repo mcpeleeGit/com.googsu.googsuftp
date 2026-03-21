@@ -1,107 +1,73 @@
-//
-//  ContentView.swift
-//  googsuftp
-//
-//  Created by dongha lee on 8/23/25.
-//
-
 import SwiftUI
 
 struct ContentView: View {
     @StateObject private var ftpManager = FTPManager()
-    @State private var selectedTab = 0
-    @State private var selectedFileItem: FTPItem?
-    
+
     var body: some View {
-        NavigationView {
-            VStack(spacing: 0) {
-                // 상단 상태바
-                statusBar
-                
-                // 탭 뷰
-                TabView(selection: $selectedTab) {
-                    // 연결 탭
-                    ConnectionView(ftpManager: ftpManager)
-                        .tabItem {
-                            Image(systemName: "link")
-                            Text("연결")
-                        }
-                        .tag(0)
-                    
-                    // 파일 브라우저 탭
-                    FileBrowserView(ftpManager: ftpManager)
-                        .tabItem {
-                            Image(systemName: "folder")
-                            Text("파일")
-                        }
-                        .tag(1)
-                        .disabled(ftpManager.connectionState != .connected)
-                    
-                    // 파일 전송 탭
-                    FileTransferView(ftpManager: ftpManager)
-                        .tabItem {
-                            Image(systemName: "arrow.up.arrow.down")
-                            Text("전송")
-                        }
-                        .tag(2)
-                        .disabled(ftpManager.connectionState != .connected)
-                }
-                .onAppear {
-                    // 연결 탭은 항상 활성화
-                }
-            }
-            .navigationTitle("GoogsuFTP")
-            .toolbar {
-                ToolbarItem(placement: .automatic) {
-                    Button(action: refreshConnection) {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    .disabled(ftpManager.connectionState != .connected)
-                }
-            }
+        HSplitView {
+            sidebar
+                .frame(minWidth: 320, idealWidth: 360, maxWidth: 420)
+            FileBrowserView(ftpManager: ftpManager)
+                .frame(minWidth: 720)
         }
-        .frame(minWidth: 800, minHeight: 600)
+        .frame(minWidth: 1160, minHeight: 760)
     }
-    
-    private var statusBar: some View {
-        HStack {
+
+    private var sidebar: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            ConnectionView(ftpManager: ftpManager)
+            Divider()
+            footerStatus
+        }
+        .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("GoogsuFTP")
+                .font(.system(size: 24, weight: .bold, design: .rounded))
             HStack(spacing: 8) {
                 Circle()
                     .fill(connectionStatusColor)
-                    .frame(width: 8, height: 8)
-                
+                    .frame(width: 9, height: 9)
                 Text(connectionStatusText)
-                    .font(.caption)
+                    .font(.subheadline)
                     .foregroundColor(connectionStatusColor)
             }
-            
-            Spacer()
-            
             if ftpManager.connectionState == .connected {
-                Text("현재 경로: \(ftpManager.currentDirectory)")
-                    .font(.caption)
+                Text(ftpManager.currentDirectory)
+                    .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            
-            Spacer()
-            
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(20)
+    }
+
+    private var footerStatus: some View {
+        VStack(alignment: .leading, spacing: 10) {
             if !ftpManager.operations.isEmpty {
-                HStack(spacing: 4) {
-                    Image(systemName: "clock")
-                        .font(.caption)
-                    Text("\(ftpManager.operations.count)개 작업")
-                        .font(.caption)
-                }
-                .foregroundColor(.orange)
+                Text("진행 중인 작업 \(ftpManager.operations.count)개")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            if !ftpManager.statusDetail.isEmpty {
+                Text(ftpManager.statusDetail)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(3)
             }
         }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
         .background(Color(NSColor.controlBackgroundColor))
     }
-    
+
     private var connectionStatusColor: Color {
         switch ftpManager.connectionState {
         case .disconnected:
@@ -114,23 +80,17 @@ struct ContentView: View {
             return .red
         }
     }
-    
+
     private var connectionStatusText: String {
         switch ftpManager.connectionState {
         case .disconnected:
             return "연결되지 않음"
         case .connecting:
-            return "연결 중..."
+            return "연결 중"
         case .connected:
             return "연결됨"
         case .error(let message):
             return "오류: \(message)"
-        }
-    }
-    
-    private func refreshConnection() {
-        if ftpManager.connectionState == .connected {
-            ftpManager.listDirectory()
         }
     }
 }

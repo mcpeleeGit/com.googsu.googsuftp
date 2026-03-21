@@ -11,12 +11,13 @@ struct ConnectionView: View {
     @State private var encryptionMode: FTPEncryptionMode = .plain
     @State private var logonType: FTPLogonType = .normal
     @State private var showPassword: Bool = false
-    @State private var showAdvancedOptions: Bool = true
+    @State private var showAdvancedOptions: Bool = false
     @State private var dataConnectionMode: FTPDataConnectionMode = .automatic
     @State private var listingMode: FTPListingMode = .automatic
     @State private var passiveHostMode: FTPPassiveHostMode = .automatic
     @State private var initialPath: String = ""
     @State private var timeoutSeconds: Double = 10
+    @State private var selectedSavedConnectionID: UUID?
     
     var body: some View {
         ScrollView {
@@ -25,6 +26,7 @@ struct ConnectionView: View {
                     .font(.largeTitle)
                     .fontWeight(.bold)
                 
+                savedConnectionsView
                 recentConnectionsView
                 connectionForm
                 connectionStatusView
@@ -165,8 +167,15 @@ struct ConnectionView: View {
                 }
                 .padding(.top, 8)
             } label: {
-                Text("고급 접속 옵션")
-                    .fontWeight(.medium)
+                Button(action: { showAdvancedOptions.toggle() }) {
+                    HStack(spacing: 8) {
+                        Text("고급 접속 옵션")
+                            .fontWeight(.medium)
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
             }
         }
         .padding()
@@ -188,38 +197,53 @@ struct ConnectionView: View {
                     }
                     
                     ForEach(ftpManager.recentConnections) { item in
-                        HStack(spacing: 10) {
-                            Button(action: { applyRecentConnection(item) }) {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(item.displayName)
-                                        .font(.subheadline)
-                                        .fontWeight(.medium)
-                                        .foregroundColor(.primary)
-                                    Text("\(item.host):\(item.port) · \(item.encryptionMode.title) · \(item.logonType.title)")
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
-                                    Text(item.options.dataConnectionMode.title)
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
-                                    Text(relativeDateText(for: item.lastUsedAt))
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.vertical, 6)
-                            }
-                            .buttonStyle(.plain)
-                            
-                            Button(action: { ftpManager.removeRecentConnection(item) }) {
-                                Image(systemName: "trash")
-                                    .foregroundColor(.red)
-                            }
-                            .buttonStyle(.plain)
+                        RecentConnectionRow(
+                            item: item,
+                            subtitle: relativeDateText(for: item.lastUsedAt),
+                            onSelect: { applyRecentConnection(item) },
+                            onDelete: { ftpManager.removeRecentConnection(item) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private var savedConnectionsView: some View {
+        Group {
+            if !ftpManager.savedConnections.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text("저장된 접속정보")
+                            .font(.headline)
+                        Spacer()
+                        if let selectedSavedConnection {
+                            Text("선택됨: \(selectedSavedConnection.displayName)")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        } else {
+                            Text("자주 쓰는 서버를 저장해 두고 불러올 수 있습니다")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
                         }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Color(NSColor.controlBackgroundColor))
-                        .cornerRadius(8)
+                    }
+
+                    ForEach(ftpManager.savedConnections) { item in
+                        SavedConnectionRow(
+                            item: item,
+                            subtitle: relativeDateText(for: item.updatedAt),
+                            isSelected: selectedSavedConnectionID == item.id,
+                            onSelect: {
+                                selectedSavedConnectionID = item.id
+                                applySavedConnection(item)
+                            },
+                            onDelete: {
+                                ftpManager.removeSavedConnection(item)
+                                if selectedSavedConnectionID == item.id {
+                                    selectedSavedConnectionID = nil
+                                }
+                            }
+                        )
                     }
                 }
             }
@@ -242,7 +266,7 @@ struct ConnectionView: View {
                     .foregroundColor(.secondary)
             }
             
-            if !ftpManager.attemptPlan.isEmpty {
+            if shouldShowRetryDiagnostics {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("목록 조회 재시도")
                         .font(.caption)
@@ -343,6 +367,23 @@ struct ConnectionView: View {
     private var actionButtons: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 12) {
+                Button(action: saveCurrentConnectionProfile) {
+                    Label(selectedSavedConnection == nil ? "접속정보 저장" : "선택 항목 업데이트", systemImage: selectedSavedConnection == nil ? "bookmark" : "square.and.pencil")
+                        .frame(minWidth: 140)
+                }
+                .buttonStyle(.bordered)
+                .disabled(host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                if selectedSavedConnection != nil {
+                    Button(action: clearSavedConnectionSelection) {
+                        Label("새 항목으로", systemImage: "plus.circle")
+                            .frame(minWidth: 110)
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+
+            HStack(spacing: 12) {
                 Button(action: connectToServer) {
                     HStack {
                         if ftpManager.connectionState == .connecting {
@@ -369,7 +410,7 @@ struct ConnectionView: View {
                 .disabled(ftpManager.connectionState == .disconnected)
             }
             
-            if !host.isEmpty {
+            if shouldShowQuickRetryButtons {
                 HStack(spacing: 10) {
                     quickRetryButton("PASV만 재시도", dataMode: .pasvOnly)
                     quickRetryButton("EPSV만 재시도", dataMode: .epsvOnly)
@@ -430,6 +471,19 @@ struct ConnectionView: View {
         case .error:
             return "재연결"
         }
+    }
+
+    private var shouldShowRetryDiagnostics: Bool {
+        ftpManager.connectionState != .connected && !ftpManager.attemptPlan.isEmpty
+    }
+
+    private var shouldShowQuickRetryButtons: Bool {
+        !host.isEmpty && ftpManager.connectionState != .connected
+    }
+
+    private var selectedSavedConnection: FTPSavedConnection? {
+        guard let selectedSavedConnectionID else { return nil }
+        return ftpManager.savedConnections.first { $0.id == selectedSavedConnectionID }
     }
     
     private var troubleshootingHelpView: some View {
@@ -546,9 +600,40 @@ struct ConnectionView: View {
         guard let server = ftpManager.lastUsedServer, host.isEmpty else { return }
         apply(server: server)
     }
-    
+
+    private func applySavedConnection(_ item: FTPSavedConnection) {
+        apply(server: item.asServer())
+    }
+
     private func applyRecentConnection(_ item: FTPRecentConnection) {
         apply(server: item.asServer())
+    }
+
+    private func saveCurrentConnectionProfile() {
+        guard let portInt = Int(port) else { return }
+        let trimmedName = connectionName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseServer = buildServer(port: portInt)
+        let targetID = selectedSavedConnectionID ?? UUID()
+        let server = FTPServer(
+            host: baseServer.host,
+            port: baseServer.port,
+            username: baseServer.username,
+            password: baseServer.password,
+            encryptionMode: baseServer.encryptionMode,
+            logonType: baseServer.logonType,
+            connectionName: trimmedName.isEmpty
+                ? FTPRecentConnection.makeDefaultName(host: baseServer.host, port: baseServer.port, username: baseServer.username, logonType: baseServer.logonType)
+                : trimmedName,
+            options: baseServer.options
+        )
+        ftpManager.saveConnectionProfile(server, replacing: targetID)
+        selectedSavedConnectionID = targetID
+        connectionName = server.connectionName
+    }
+
+    private func clearSavedConnectionSelection() {
+        selectedSavedConnectionID = nil
+        connectionName = connectionName.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     
     private func apply(server: FTPServer) {
@@ -589,6 +674,134 @@ struct ConnectionView: View {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .short
         return formatter.localizedString(for: date, relativeTo: Date())
+    }
+}
+
+private struct RecentConnectionRow: View {
+    let item: FTPRecentConnection
+    let subtitle: String
+    let onSelect: () -> Void
+    let onDelete: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button(action: onSelect) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.displayName)
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                        .foregroundColor(.primary)
+                    Text("\(item.host):\(item.port) · \(item.encryptionMode.title) · \(item.logonType.title)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Text(item.options.dataConnectionMode.title)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Text(subtitle)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Button(action: onDelete) {
+                Image(systemName: "trash")
+                    .foregroundColor(.red)
+            }
+            .buttonStyle(.plain)
+            .padding(.trailing, 2)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(isHovered ? Color.accentColor.opacity(0.12) : Color(NSColor.controlBackgroundColor))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(isHovered ? Color.accentColor.opacity(0.22) : Color.clear, lineWidth: 1)
+        )
+        .cornerRadius(8)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            isHovered = hovering
+        }
+    }
+}
+
+private struct SavedConnectionRow: View {
+    let item: FTPSavedConnection
+    let subtitle: String
+    let isSelected: Bool
+    let onSelect: () -> Void
+    let onDelete: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button(action: onSelect) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(item.displayName)
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                            .foregroundColor(.primary)
+                        if isSelected {
+                            Text("편집 중")
+                                .font(.caption2)
+                                .foregroundColor(.blue)
+                        }
+                    }
+                    Text("\(item.host):\(item.port) · \(item.encryptionMode.title) · \(item.logonType.title)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Text(item.options.dataConnectionMode.title)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Text("수정 \(subtitle)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Button(action: onDelete) {
+                Image(systemName: "trash")
+                    .foregroundColor(.red)
+            }
+            .buttonStyle(.plain)
+            .padding(.trailing, 2)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(backgroundColor)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(borderColor, lineWidth: 1)
+        )
+        .cornerRadius(8)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            isHovered = hovering
+        }
+    }
+
+    private var backgroundColor: Color {
+        if isSelected {
+            return Color.accentColor.opacity(0.14)
+        }
+        return isHovered ? Color.accentColor.opacity(0.12) : Color(NSColor.controlBackgroundColor)
+    }
+
+    private var borderColor: Color {
+        if isSelected {
+            return Color.accentColor.opacity(0.35)
+        }
+        return isHovered ? Color.accentColor.opacity(0.22) : Color.clear
     }
 }
 
